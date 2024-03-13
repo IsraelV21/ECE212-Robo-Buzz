@@ -1,0 +1,901 @@
+#include <Adafruit_I2CDevice.h>
+#include <Adafruit_BusIO_Register.h>
+#include <Adafruit_seesaw.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <NTPClient.h> // Include the NTPClient library
+// Servo and Ultrasonic sensor libraries
+#include <Servo.h>
+#include <NewPing.h>
+
+
+//Time
+# include <RTC.h>
+# include <NTPClient.h>
+# if defined(ARDUINO_PORTENTA_C33)
+# include <WiFiC3.h>
+# elif defined(ARDUINO_UNOWIFIR4)
+# include <WiFiS3.h>
+# endif
+
+# include <WiFiUdp.h>
+# define SECRET_SSID "TOKILAP"
+# define SECRET_PASS "12345678"
+
+# include "pitches.h"
+
+///////please enter your sensitive data in the Secret tab/arduino_secrets.h
+char ssid[] = SECRET_SSID;        // your network SSID (name)
+char pass[] = SECRET_PASS;    // your network password (use for WPA, or use as key for WEP)
+
+int wifiStatus = WL_IDLE_STATUS;
+WiFiUDP Udp; // A UDP instance to let us send and receive packets over UDP
+NTPClient timeClient(Udp);
+
+void printWifiStatus() {
+  // print the SSID of the network you're attached to:
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  // print your board's IP address:
+  IPAddress ip = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+}
+
+#include <WiFi.h> // Include the WiFi library
+
+void connectToWiFi(){
+  // check for the WiFi module:
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("Communication with WiFi module failed!");
+    // don't continue
+    while (true);
+  }
+
+  String fv = WiFi.firmwareVersion();
+  if (fv < WIFI_FIRMWARE_LATEST_VERSION) {
+    Serial.println("Please upgrade the firmware");
+  }
+
+  // attempt to connect to WiFi network:
+  while (wifiStatus != WL_CONNECTED) {
+    Serial.print("Attempting to connect to SSID: ");
+    Serial.println(ssid);
+    // Connect to WPA/WPA2 network. Change this line if using open or WEP network:
+    wifiStatus = WiFi.begin(ssid, pass);
+
+    // wait 10 seconds for connection:
+    delay(10000);
+  }
+
+  Serial.println("Connected to WiFi");
+  printWifiStatus();
+}
+// Notes for I2C bus: gamepad 0x50, LCD 0x27
+Adafruit_seesaw ss;
+LiquidCrystal_I2C lcd(0x27, 16, 2); // set the LCD address to 0x27 for a 16 chars and 2 line display
+
+
+// Arduino pin trigger pin on the ultrasonic sensor
+#define TRIGGER_PIN  9
+
+// Arduino pin echo pin on the ultrasonic sensor 
+#define ECHO_PIN     8 
+
+// buzzer GPIO pin
+# define BUZZER_PIN 13
+
+// Maximum distance we want to ping for
+#define MAX_DISTANCE 200 
+
+// distance before movement changes
+#define MIN_DISTANCE 35
+
+// minimum distance before switching out of Move Backward state
+#define MIN_BACK_DISTANCE 60
+
+// if you are reading less than this on sensor, you are hitting a wall
+ #define WALL_DISTANCE 10 //essentially MIN_MIN_DISTANCE
+
+
+// Gamepad
+#define BUTTON_X 6
+#define BUTTON_Y 2
+#define BUTTON_A 5
+#define BUTTON_B 1
+#define BUTTON_SELECT 0
+#define BUTTON_START 16
+uint32_t button_mask = (1UL << BUTTON_X) | (1UL << BUTTON_Y) | (1UL << BUTTON_START) |
+                       (1UL << BUTTON_A) | (1UL << BUTTON_B) | (1UL << BUTTON_SELECT);
+
+//---------------------GLOBAL CONSTANTS-----------------------------//
+
+//Motor A (right)
+const int enA = 6; // PWM pin
+const int in1 = 3;
+const int in2 = 4;
+
+//Motor B (left)
+const int enB = 5; // PWM pin
+const int in3 = 1;
+const int in4 = 2;
+
+const long SCAN_TIME = 100; // wait time for ultrasonic scanning
+const long MOVE_TIME = 250; // wait time for motors (for HistoryOutput/RollBack)
+const long SERVO_TIME = 100; // wait time for servo steps
+const long CHOICE_TIME = 100; // wait time for next movement choice (unused)
+
+
+// Function
+void stopwatch();
+void setalarm();
+void displayTime();
+// ADDed
+void AlarmRun(int alarm_hr, int alarm_min, int currHr, int currMin);
+int get();
+void scan();
+int DistCheck(int r, int f, int l);
+void MoveChoice(int choice);
+void Avoid();
+void HistoryOutput();
+void WallFound(int direction);
+int BackOptions(int r, int l);
+void LeftPivot();
+void RightPivot();
+void ForwardMove();
+void BackwardMove();
+void StopMove();
+
+
+//Global variable
+// alarm
+int alarm_hr = 0;
+int alarm_min = 0;
+// mode
+int mode = 0;
+
+
+// Time of previous servo movement in milliseconds
+unsigned long lastServoTime = 0;
+
+// Time of previous scan time in milliseconds
+unsigned long lastScanTime = 0;
+
+// Time of previous motor movement in millisceconds
+unsigned long lastMoveTime = 0;
+
+// Time of previous movement choice in milliseconds (UNUSED)
+unsigned long lastChoiceTime = 0;
+
+// stores current motor speed (half of max speed at the moment) : 127
+int motorSpeed = 140;
+
+// servo position (in degrees)
+int pos = 0;
+
+// servo step size
+int step = 30;
+
+// stores last 15 movements 
+int history[16];
+char* directions[] = {"FORWARD", "LEFT", "RIGHT", "BACKWARD"};
+int distances[3]; // right, front, left
+
+// buzzer notes array
+
+// notes in the melody:
+int melody[] = {
+ NOTE_C4, NOTE_G3, NOTE_G3, NOTE_A3, NOTE_G3, 0, NOTE_B3, NOTE_C4
+};
+
+// note durations: 4 = quarter note, 8 = eighth note, etc.:
+int noteDurations[] = {
+ 4, 8, 8, 4, 4, 4, 4, 4
+};
+
+
+// determines where in array the choices are stored
+int choice_index;
+
+// distance values (right, front, left)
+int r, f, l;
+
+// flags 
+
+// check if moving back
+bool back_flag = false;
+
+// NewPing setup of pins and maximum distance.
+NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
+
+// Create Servo object
+Servo panMotor;
+void setup()
+{
+
+
+
+  WiFiUDP ntpUDP;
+  NTPClient timeClient(ntpUDP, "pool.ntp.org"); // Declare the timeClient object
+
+  Serial.begin(9600);
+  //Time part
+  connectToWiFi();
+  RTC.begin();
+  Serial.println("\nStarting connection to server...");
+  timeClient.begin();
+  timeClient.update();
+
+  // Get the current date and time from an NTP server and convert
+  // it to UTC -8 by passing the time zone offset in hours.
+  // You may change the time zone offset to your local one.
+  auto timeZoneOffsetHours = -7;
+  auto unixTime = timeClient.getEpochTime() + (timeZoneOffsetHours * 3600);
+  Serial.print("Unix time = ");
+  Serial.println(unixTime);
+  RTCTime timeToSet = RTCTime(unixTime);
+  RTC.setTime(timeToSet);
+
+  // Retrieve the date and time from the RTC and print them
+  RTCTime currentTime;
+  RTC.getTime(currentTime);
+  Serial.println("The RTC was just set to: " + String(currentTime));
+
+  //LCD init
+  lcd.init(); // initialize the lcd
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Starting...");
+  delay(1000);
+
+  while (!Serial)
+  {
+    delay(10);
+  }
+
+  Serial.println("Gamepad QT example!");
+
+  if (!ss.begin(0x50))
+  {
+    Serial.println("ERROR! seesaw not found");
+    while (1)
+      delay(1);
+  }
+  Serial.println("seesaw started");
+  uint32_t version = ((ss.getVersion() >> 16) & 0xFFFF);
+  if (version != 5743)
+  {
+    Serial.print("Wrong firmware loaded? ");
+    Serial.println(version);
+    while (1)
+      delay(10);
+  }
+  Serial.println("Found Product 5743");
+
+  ss.pinModeBulk(button_mask, INPUT_PULLUP);
+  ss.setGPIOInterrupts(button_mask, 1);
+
+
+  // movement setup
+  pinMode(enA, OUTPUT);
+  pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+
+  // servo setup
+  
+  panMotor.attach(11); //attach motors to proper pins
+  panMotor.write(90); //set servo to center  
+
+  // set initial motor speed (127)
+  analogWrite(enA, motorSpeed); // speed is a value from 0 to 255
+  analogWrite(enB, motorSpeed); // speed is a value from 0 to 255
+  Serial.println("Setup complete");
+
+}
+
+int last_x = 0, last_y = 0;
+
+void loop() {
+  // DEbug
+  Serial.println("Looping");
+  delay(100);
+  uint32_t buttons = ss.digitalReadBulk(button_mask);
+  static bool lastSelectState = HIGH;
+  bool selectState = (buttons & (1UL << BUTTON_SELECT));
+  unsigned long currentTime = millis();
+  static unsigned long lastButtonPressTime = 0; // For debouncing
+  const unsigned long debounceDelay = 200; // Debounce delay in milliseconds
+  static int prevMode = -1; // Add a variable to keep track of the previous mode
+
+  if (!selectState && lastSelectState && currentTime - lastButtonPressTime > debounceDelay) {
+    mode = (mode + 1) % 3; // Cycle through modes
+    lastButtonPressTime = currentTime;
+    Serial.print("Button pressed! ");
+    Serial.print("Mode: ");
+    Serial.println(mode);
+    lcd.clear();
+  }
+  lastSelectState = selectState;
+  if (mode != prevMode) { // Only call setalarm() or stopwatch() when the mode changes
+  switch (mode) {
+    case 0:
+      // Display time mode
+      Serial.println("Went to display time mode");
+      displayTime();
+    
+      break;
+    case 1:
+      // Set alarm mode
+      setalarm();
+      break;
+    case 2:
+      // Stopwatch mode
+      stopwatch();
+      break;
+  }
+    prevMode = mode; // Update the previous mode
+}
+}
+
+// movement functions
+
+
+// ultrasonic senor pings and recieves distance in centimeters
+int get() {
+  unsigned int time = sonar.ping();          //Send out a ping and store the time it took for it to come back in the time variable
+  int distance = time / US_ROUNDTRIP_CM;    //Convert that time into a distance
+
+
+
+  if ( distance == 0 || distance == 5 ) {   //If no ping was recieved
+  //if ( distance == 0) {  
+    distance = 100;                         //Set the distance to max
+  }
+  if (millis() - lastScanTime >= SCAN_TIME){
+    lastScanTime = millis();
+    return distance;
+  }
+
+
+  //return distance;
+}
+
+// Servo sweeps from 0-180 degrees
+void scan() {
+  // 100 ms pass since last servo step
+  if(millis() - lastServoTime >= SERVO_TIME) {  
+    panMotor.write(pos);
+    if (pos > 180) {
+      pos = 180;
+      step = -step;
+
+      //Serial.println("CURRENT STEP:"); // hard to see in serial monitor due to speed 
+      //Serial.println(step);
+    }
+    if (pos < 0) {
+      pos = 0;
+      step = abs(step);
+      //Serial.println("CURRENT STEP:"); // hard to see in serial monitor due to speed 
+      //Serial.println(step);
+    }
+    //Serial.println(pos); // checks theoritical position. should be similar to servo.read() output if nothing is wrong
+    pos += step;
+
+    //Serial.println("CURRENT POSITION?:");
+    //Serial.println(panMotor.read()); // prints position of last servo.write().
+    
+    lastServoTime =  millis();
+  }
+}
+
+// picks between left and right directions if back_flag is true
+int BackOptions(int r, int l) {
+  while(back_flag && f >= 50) {
+    // right distance longer than left
+    if (r > l){
+      // turn r
+      back_flag = false;
+      return 1;
+    }
+    // left distance longer than right
+    else {
+      // turn l
+      back_flag = false;
+      return 2;
+    }
+  }
+}
+
+// compares distance between left, right, and front distances
+int DistCheck(int r, int f, int l) {
+  int choice; // currently only for forward condition
+
+  // moving backward and < 50 cm from object
+  if ((back_flag) && (f <= 50))
+    // choice = back
+    return 3;
+  else if(back_flag && (f > 50)) {
+    // new decision() // this clears back flag. only left or right
+    // return after
+    return BackOptions(r, l);
+  } 
+
+  // if space between front of robot and obstacle <= MIN_DISTANCE (35cm)
+  if (f <= MIN_DISTANCE) {  //no space to go forward
+    StopMove();
+    //stop_flag = true; // currently unused (might remove)
+
+    //check if space to turn left
+    if (l > MIN_DISTANCE) { // may have slight preference for left turns
+      if (l > r) {
+        //WallFound(l);
+        //turn left
+        return 2;
+      }
+    }
+
+    //no left turn
+    if (r > MIN_DISTANCE) {
+      if (r>l)
+      //WallFound(r); 
+      // turn right
+      return 1;
+    }
+
+    // couldn't go forward, left, or right
+    // go backward
+    return 3;
+  }
+  
+  
+  if(f > MIN_DISTANCE) { // f > MIN_DISTANCE
+    choice = 0; // move foward
+  }
+  return choice;
+}
+
+// Motor movement Functions
+
+// turns on right motor to pivot robot to the left
+void LeftPivot() {
+    // turn off motor A (left wheel ?) RIGHT
+    digitalWrite(in1, HIGH); 
+    digitalWrite(in2, LOW);
+
+    //digitalWrite(in1, LOW);
+    //digitalWrite(in1, LOW);
+
+    // turn on motor B (right wheel ?) LEFT
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, LOW);
+    //digitalWrite(in3, HIGH);
+    //digitalWrite(in4, LOW);
+}
+
+// turns on left motor to pivot robot to the right
+void RightPivot() {
+    // turn off motor A (left wheel ?) RIGHT
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+
+
+    // turn off motor B (right wheel ?) LEFT
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, HIGH);
+}
+
+// turns on both motors to move robot forward
+void ForwardMove() {
+    // turn on motor A
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+
+    // Turn on motor B
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, HIGH);
+}
+
+// turns on both motors in reverse to move robot backward
+void BackwardMove() {
+    // turn on motor A in reverse (NEED TO TEST)
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+
+    // Turn on motor B in reverse (NEED TO TEST)
+    digitalWrite(in3, HIGH);
+    digitalWrite(in4, LOW);
+}
+
+// stops all movement from motors
+void StopMove() {
+    // turn off both motors
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, LOW);
+}
+
+// if some direction is close to a wall, go back and turn away
+void WallFound(int direction) {
+  // for a quarter second, go back and pivot away from object
+  while(millis() - lastMoveTime >= MOVE_TIME){
+    BackwardMove();
+    if (direction == l) {
+      RightPivot();
+    }
+    
+    if (direction == r) {
+      LeftPivot();
+    }
+  }
+  lastMoveTime = millis();
+}
+
+// runs motor movement based off right, front, and left distances
+void MoveChoice(int choice) {
+  switch (choice){
+    case 0:
+    // forward move
+    //Serial.println("MOVING FORWARD...");
+    ForwardMove();
+    //--back_percent;
+    break;
+    case 1:
+    // pivot right
+    //Serial.println("TURNING RIGHT...");
+    RightPivot();
+    //--back_percent;
+    break;
+    case 2:
+    // pivot left
+    //Serial.println("TURNING LEFT...");
+    LeftPivot();
+    //--back_percent;
+    break;
+    case 3:
+    // backward move
+    //Serial.println("MOVING BACKWARD...");
+    BackwardMove();
+    back_flag = true;
+    //++back_percent;
+    break;
+  }
+
+  // record choice
+
+  //increment index
+  ++choice_index %= 16;
+  //store value
+  history[choice_index] = choice;
+}
+
+// reads history index and outputs last read distances/directions.
+// should output direction and distance every 250ms
+void HistoryOutput() {
+  if (millis() - lastMoveTime >= MOVE_TIME) {
+    // index is forward choice
+    if (history[choice_index] == 0) {
+      Serial.println(directions[0]);
+      Serial.println(distances[1]);
+    }
+    // index is right turn choice
+    else if (history[choice_index] == 1) {
+      Serial.println(directions[2]);
+      Serial.println(distances[0]);
+    }
+    // index is left turn choice
+    else if (history[choice_index] == 1) {
+      Serial.println(directions[1]);
+      Serial.println(distances[2]);
+    }
+  }
+  lastMoveTime = millis();
+}
+
+void Avoid() {
+  
+  // should read multiple times at about 30 degrees (RIGHT)
+  if (panMotor.read() > 20 && panMotor.read() < 50) { 
+    r = get();
+    distances[0] = r; // records distance for HistoryOutput()
+    Serial.println("RIGHT DISTANCE:");
+    Serial.println(r);
+  }
+  // should read multiple times at about 90 degrees (FRONT)
+  if ((panMotor.read() > 70) && (panMotor.read() < 110)) { 
+    f = get();
+    distances[1] = f; // records distance for HistoryOutput()
+    Serial.println("FRONT DISTANCE:");
+    Serial.println(f);    
+  }
+  // should read multiple times at about 150 degrees (LEFT)
+  if(panMotor.read() > 130 && panMotor.read() < 160) { 
+    l = get();
+    distances[2] = l; // records distance for HistoryOutput()
+    Serial.println("LEFT DISTANCE:");
+    Serial.println(l);
+  }
+
+  int choice = DistCheck(r, f, l);
+
+  MoveChoice(choice); 
+}
+
+
+// display functions 
+void stopwatch() { 
+  static bool stopwatchRunning = false;
+  static unsigned long startTime = 0;
+  unsigned long elapsedTime = 0;
+  bool exit = false;
+  static unsigned long lastButtonPressTime = 0; // For debouncing
+  const unsigned long debounceDelay = 200; // Debounce delay in milliseconds
+  bool selectPressed = false;
+  // Last known states of buttons
+
+  Serial.println("Stopwatch started!");
+
+  while (!selectPressed) {
+    uint32_t buttons = ss.digitalReadBulk(button_mask);
+    bool selectState = buttons & (1UL << BUTTON_SELECT);
+    bool startState = buttons & (1UL << BUTTON_START);
+    bool aState = buttons & (1UL << BUTTON_A);
+    unsigned long currentTime = millis();
+
+    //Change
+      static bool lastSelectState = HIGH;
+      static bool lastStartState = HIGH;
+      static bool lastAState = HIGH;
+
+    // Check for SELECT button press for exit
+    if (!selectState && lastSelectState && currentTime - lastButtonPressTime > debounceDelay) {
+      selectPressed = true;
+      lastButtonPressTime = currentTime;
+    }
+    lastSelectState = selectState;
+
+    // Check for START button press to start/stop stopwatch
+    if (!startState && lastStartState && currentTime - lastButtonPressTime > debounceDelay) {
+      stopwatchRunning = !stopwatchRunning; // Toggle running state
+      if (stopwatchRunning) {
+        startTime = millis() - elapsedTime; // Resume from the last elapsed time
+        Serial.println("Stopwatch started/resumed");
+      } else {
+        elapsedTime = millis() - startTime; // Update elapsed time
+        Serial.println("Stopwatch paused");
+      }
+      lastButtonPressTime = currentTime;
+    }
+    lastStartState = startState;
+
+    // Check for A button press to reset stopwatch
+    if (!aState && lastAState && currentTime - lastButtonPressTime > debounceDelay) {
+      stopwatchRunning = false;
+      elapsedTime = 0;
+      Serial.println("Stopwatch reset");
+      lastButtonPressTime = currentTime;
+    }
+    lastAState = aState;
+
+    // Update the elapsed time if the stopwatch is running
+    if (stopwatchRunning) {
+      elapsedTime = millis() - startTime;
+    }
+
+    // Update the display every second
+    static unsigned long lastUpdateTime = 0;
+    if (currentTime - lastUpdateTime > 1000) { // Update every second
+      lastUpdateTime = currentTime;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Time: ");
+      int seconds = (elapsedTime / 1000) % 60;
+      int minutes = (elapsedTime / (1000 * 60)) % 60;
+      int hours = (elapsedTime / (1000 * 60 * 60));
+
+      if (hours < 10) lcd.print('0');
+      lcd.print(hours);
+      lcd.print(":");
+      if (minutes < 10) lcd.print('0');
+      lcd.print(minutes);
+      lcd.print(":");
+      if (seconds < 10) lcd.print('0');
+      lcd.print(seconds);
+      lcd.setCursor(0, 1);
+      lcd.print("Press A to reset");
+    }
+  }
+
+  Serial.println("Stopwatch exited");
+  Serial.println("Goback to main menu");
+   lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Mode:  Time display :)");
+}
+
+void setalarm() {
+  static enum {EDIT_HOUR, EDIT_MINUTE} editState = EDIT_HOUR; // Keep track of which part of the time to edit
+  bool selectPressed = false; // Flag to check if select is pressed to exit
+
+  while (!selectPressed) { // Stay in this function until SELECT is pressed
+    uint32_t buttons = ss.digitalReadBulk(button_mask);
+    bool aState = (buttons & (1UL << BUTTON_A));
+    bool xState = (buttons & (1UL << BUTTON_X));
+    bool selectState = (buttons & (1UL << BUTTON_SELECT));
+    static bool lastAState = HIGH, lastXState = HIGH, lastSelectState = HIGH;
+    unsigned long currentTime = millis();
+    static unsigned long lastButtonPressTime = 0;
+    const unsigned long debounceDelay = 200;
+
+    //DeBug
+    Serial.println("Setting alarm");
+    // A button logic to increase time
+    if (aState != lastAState && currentTime - lastButtonPressTime > debounceDelay) {
+      if (!aState) { // A button pressed
+        if (editState == EDIT_HOUR) {
+          alarm_hr = (alarm_hr + 1) % 24;
+        } else {
+          alarm_min = (alarm_min + 1) % 60;
+        }
+        lastButtonPressTime = currentTime;
+      }
+    }
+
+    // X button logic to toggle edit state
+    if (xState != lastXState && currentTime - lastButtonPressTime > debounceDelay) {
+      if (!xState) { // X button pressed
+        editState = (editState == EDIT_HOUR) ? EDIT_MINUTE : EDIT_HOUR;
+        lastButtonPressTime = currentTime;
+      }
+    }
+
+    // SELECT button logic to exit
+    if (selectState != lastSelectState && currentTime - lastButtonPressTime > debounceDelay) {
+      if (!selectState) { // SELECT button pressed
+        selectPressed = true;
+        lastButtonPressTime = currentTime;
+      }
+    }
+
+    lastAState = aState;
+    lastXState = xState;
+    lastSelectState = selectState;
+
+    // Display the current alarm setting
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Set Alarm:");
+    lcd.setCursor(0, 1);
+    if (alarm_hr < 10) lcd.print('0');
+    lcd.print(alarm_hr);
+    lcd.print(":");
+    if (alarm_min < 10) lcd.print('0');
+    lcd.print(alarm_min);
+
+    delay(100); // Make the screen readable
+  }
+  Serial.println("Goback to main menu");
+   lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Mode: Stopwatch :) ");
+}
+
+void displayTime() { 
+  bool selectPressed = false; // Flag to check if select is pressed to exit
+  unsigned long currentTime1 = millis();
+  static unsigned long lastButtonPressTime = 0;
+  const unsigned long debounceDelay = 200;
+  Serial.println("Displaying time INIT");
+  while (!selectPressed)
+  {
+    
+
+    uint32_t buttons = ss.digitalReadBulk(button_mask);
+    bool selectState = (buttons & (1UL << BUTTON_SELECT));
+    static bool lastSelectState = HIGH;
+
+
+    // Check for SELECT button press for exit
+    if (selectState != lastSelectState && currentTime1 - lastButtonPressTime > debounceDelay) {
+      if (!selectState) { // SELECT button pressed
+        Serial.println("SELECT button pressed");
+        selectPressed = true;
+        lastButtonPressTime = currentTime1;
+      }
+      lastSelectState = selectState;
+    }
+
+  RTCTime currentTime;
+  RTC.getTime(currentTime);
+  Serial.print("Try Current time: ");
+  //
+  // check if alarm time matches current time
+  if (alarm_hr == currentTime.getHour() && alarm_min == currentTime.getMinutes()) {
+    Serial.println("Alarm time reached!");
+    AlarmRun(alarm_hr, alarm_min, currentTime.getHour(), currentTime.getMinutes());
+  }
+
+  // Print out date (DD/MM//YYYY)
+  Serial.print(currentTime.getDayOfMonth());
+  Serial.print("/");
+  Serial.print(Month2int(currentTime.getMonth()));
+  Serial.print("/");
+  Serial.print(currentTime.getYear());
+  Serial.print(" - ");
+
+  // Print time (HH/MM/SS)
+  Serial.print(currentTime.getHour());
+  Serial.print(":");
+  Serial.print(currentTime.getMinutes());
+  Serial.print(":");
+  Serial.println(currentTime.getSeconds());
+
+//Lcd drive
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(currentTime.getHour());
+  lcd.print(":");
+  lcd.print(currentTime.getMinutes());
+  lcd.print(":");
+  lcd.print(currentTime.getSeconds());
+  delay(100); // Update every second
+
+
+    
+  }
+  Serial.println("Goback to main menu");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Mode: Alarm set ");
+}
+
+// alarm function
+// makes alarm go off. flashes light, turns on buzzer, and starts movement.
+void AlarmRun(int alarm_hr, int alarm_min, int currHr, int currMin)
+{
+  unsigned long currentTime1 = millis();
+  static unsigned long lastButtonPressTime = 0; // For debouncing
+  const unsigned long debounceDelay = 200; // Debounce delay in milliseconds
+  bool aPressed = false;
+  Serial.println("AlarmRun() called");
+
+  while (!aPressed) {
+    uint32_t buttons = ss.digitalReadBulk(button_mask);
+     bool aState = buttons & (1UL << BUTTON_A);
+      static bool lastAstate = HIGH;
+    // A button logic to increase time
+    if (aState != lastAstate && currentTime1 - lastButtonPressTime > debounceDelay) {
+      if (!aState) { // A button pressed
+        aPressed = true;
+        Serial.println("A button pressed");
+        StopMove();
+        Serial.println("StopMove() called");
+        noTone(BUZZER_PIN);
+        Serial.println("noTone() called");
+        
+        lastButtonPressTime = currentTime1;
+      }
+      lastAstate = aState;
+    }
+
+    
+        Serial.println("Alarm ON");
+        scan();
+        Avoid();
+    int noteDuration = 1000 / 4;
+    tone(BUZZER_PIN, NOTE_C4, noteDuration);
+   }
+  
+}
+  
