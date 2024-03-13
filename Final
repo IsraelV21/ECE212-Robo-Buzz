@@ -19,8 +19,8 @@
 # endif
 
 # include <WiFiUdp.h>
-# define SECRET_SSID "TOKILAP"
-# define SECRET_PASS "12345678"
+# define SECRET_SSID "Samsung Galaxy A10e_2092"
+# define SECRET_PASS "IsraelVasquez21"
 
 # include "pitches.h"
 
@@ -211,6 +211,9 @@ int r, f, l;
 
 // check if moving back
 bool back_flag = false;
+
+// check if alarm should be on/off
+bool alarm_flag = false;
 
 // NewPing setup of pins and maximum distance.
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
@@ -530,7 +533,7 @@ void StopMove() {
 void WallFound(int direction) {
   // for a quarter second, go back and pivot away from object
   while(millis() - lastMoveTime >= MOVE_TIME){
-    BackwardMove();
+    //BackwardMove();
     if (direction == l) {
       RightPivot();
     }
@@ -819,11 +822,36 @@ void displayTime() {
   RTCTime currentTime;
   RTC.getTime(currentTime);
   Serial.print("Try Current time: ");
-  //
-  // check if alarm time matches current time
+  
+  // checks if it's not time for alarm or alarm is turned off (only works if not alarm time :< )  
+  if ((alarm_hr != currentTime.getHour() || alarm_min != currentTime.getMinutes()) || !alarm_flag) {
+    // alarm off
+    alarm_flag = false;
+    
+    // motor speed 0 (stop) 
+    analogWrite(enA, 0); // speed is a value from 0 to 255
+    analogWrite(enB, 0); // speed is a value from 0 to 255
+
+    // set servo to center
+    //panMotor.write(90); //set servo to center FIXME: every minute, will jitter for 10 seconds  
+
+    // keep noise off (if any)
+    noTone(BUZZER_PIN);
+    
+  }
+
+
+  // check if it is time to turn on alarm
   if (alarm_hr == currentTime.getHour() && alarm_min == currentTime.getMinutes()) {
+    // alarm on
+    alarm_flag = true;
+    // set motor speed (running)
+    analogWrite(enA, motorSpeed); // speed is a value from 0 to 255
+    analogWrite(enB, motorSpeed); // speed is a value from 0 to 255
+
     Serial.println("Alarm time reached!");
     AlarmRun(alarm_hr, alarm_min, currentTime.getHour(), currentTime.getMinutes());
+    
   }
 
   // Print out date (DD/MM//YYYY)
@@ -884,18 +912,21 @@ void AlarmRun(int alarm_hr, int alarm_min, int currHr, int currMin)
         noTone(BUZZER_PIN);
         Serial.println("noTone() called");
         
+        // turn off (and keep off) alarm
+        //alarm_flag = false;
+        
         lastButtonPressTime = currentTime1;
+
+        // hold A to stop FIXME: press A to stop
+        //return;
       }
       lastAstate = aState;
-    }
 
-    
+    }
         Serial.println("Alarm ON");
         scan();
         Avoid();
-    int noteDuration = 1000 / 4;
+    int noteDuration = 1000 / 16;
     tone(BUZZER_PIN, NOTE_C4, noteDuration);
    }
-  
 }
-  
